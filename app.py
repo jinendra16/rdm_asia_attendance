@@ -133,6 +133,6 @@ if st.button("🚀 Generate Audit Report"):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
         else:
-            st.error("Invalid Date Format. Please use '23_Jan'")
+            st.error("Invalid Date Format. Please use 'DD_MMM'")
     else:
         st.warning("Please upload both files and enter a start date.")
