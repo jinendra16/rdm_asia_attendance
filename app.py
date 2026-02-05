@@ -44,8 +44,8 @@ def process_data(ts_file, att_file, start_date):
         )
     
     # 2. Assign "Operational Day" (Shift Day)
-    # Using 8-hour threshold as per your code
-    df['WorkDate'] = df.apply(lambda r: (r['DateTime'] - timedelta(hours=8)).date(), axis=1)
+    # RESTORED TO 5 HOURS: 8 hours was pushing 6am/7am starts to the previous day (Fixing A28, I28)
+    df['WorkDate'] = df.apply(lambda r: (r['DateTime'] - timedelta(hours=5)).date(), axis=1)
     df['TimeOnly'] = df['DateTime'].dt.time
     df['CleanName'] = df['Name'].apply(clean_name)
 
@@ -74,27 +74,29 @@ def process_data(ts_file, att_file, start_date):
             logout_time = None
             
             if not day_logs.empty:
-                # --- REQUIREMENT 2: LOGIN LOGIC ---
-                # Priority: Start Work > Site In. 
-                # If neither exists, strictly "NO LOGIN" (Fix for M32)
-                start_work_logs = day_logs[day_logs['Type'] == 'Start Work']
-                site_in_logs = day_logs[day_logs['Type'] == 'Site In']
+                # --- LOGIN LOGIC (Fixing M32) ---
+                # Strictly look for Start Work or Site In.
+                # If neither exists, force "NO LOGIN".
+                starts = day_logs[day_logs['Type'] == 'Start Work']
+                sites_in = day_logs[day_logs['Type'] == 'Site In']
                 
-                if not start_work_logs.empty:
-                    login_time = start_work_logs.iloc[0]['TimeOnly']
-                elif not site_in_logs.empty:
-                    login_time = site_in_logs.iloc[0]['TimeOnly']
+                if not starts.empty:
+                    # Priority 1: Start Work
+                    login_time = starts.sort_values('DateTime').iloc[0]['TimeOnly']
+                elif not sites_in.empty:
+                    # Priority 2: Site In
+                    login_time = sites_in.sort_values('DateTime').iloc[0]['TimeOnly']
                 else:
+                    # No valid login event found
                     login_time = "NO LOGIN"
 
-                # --- REQUIREMENT 1 & 3: LOGOUT LOGIC ---
-                # Look for valid logout events (End Work / Site Out)
-                # Sort by time and take the LAST one (Fix for H40)
-                # Do this even if login is "NO LOGIN" (Fix for N32)
+                # --- LOGOUT LOGIC (Fixing H40, N32) ---
+                # Look for valid logout events (End Work OR Site Out).
+                # Combine them and take the ABSOLUTE LAST one by time.
                 valid_logouts = day_logs[day_logs['Type'].isin(['End Work', 'Site Out'])]
                 
                 if not valid_logouts.empty:
-                    # Sort strictly by time to ensure we get the latest event
+                    # Sort by time to find the actual last event
                     last_logout_event = valid_logouts.sort_values('DateTime').iloc[-1]
                     logout_time = last_logout_event['TimeOnly']
                 else:
@@ -102,7 +104,6 @@ def process_data(ts_file, att_file, start_date):
 
                 # --- CLEANUP FOR EMPTY DAYS ---
                 # If a day has NO valid Login AND NO valid Logout, clear the cells completely
-                # so it doesn't look like an error for someone who just didn't work.
                 if login_time == "NO LOGIN" and logout_time == "NO LOGOUT":
                     login_time = None
                     logout_time = None
@@ -113,8 +114,7 @@ def process_data(ts_file, att_file, start_date):
                 elif login_time == "NO LOGIN" and logout_time is not None:
                      exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': logout_time, 'Reason': 'Logout without Login'})
                 elif login_time and logout_time:
-                    # Check for "Site In without Site Out" sequence logic if needed
-                    # (kept simple here to prioritize your 3 main requests)
+                    # Optional: Check for sequence issues if needed
                     pass
 
             # Handle explicit None for output
