@@ -24,6 +24,17 @@ def clean_name(name):
     if pd.isna(name): return ""
     return re.sub(r'[^a-zA-Z0-9]', '', str(name).upper())
 
+def add_time_column(df):
+    """
+    Automatically add the time extraction column after 'Date Time'
+    Mimics Excel formula: =TIMEVALUE(RIGHT(G2,5))
+    """
+    # Extract the last 5 characters (HH:MM) from Date Time and convert to time
+    df['TimeExtracted'] = df['Date Time'].apply(lambda x: 
+        pd.to_datetime(str(x)[-5:], format='%H:%M').time() if pd.notna(x) and len(str(x)) >= 5 else None
+    )
+    return df
+
 def process_data(ts_file, att_file, start_date):
     # Date Setup
     end_date = start_date + timedelta(days=6)
@@ -36,6 +47,14 @@ def process_data(ts_file, att_file, start_date):
     else:
         df = pd.read_excel(ts_file)
     
+    # NEW: Automatically add the time column if it doesn't exist
+    if 'TimeExtracted' not in df.columns and 'Unnamed: 7' not in df.columns:
+        df = add_time_column(df)
+        st.info("✓ Time column automatically added to timesheet data")
+    elif 'Unnamed: 7' in df.columns:
+        # File already has the time column
+        df['TimeExtracted'] = df['Unnamed: 7']
+    
     # 1. Precise DateTime Parsing
     if 'Date Time' in df.columns:
         df['DateTime'] = pd.to_datetime(
@@ -44,7 +63,6 @@ def process_data(ts_file, att_file, start_date):
         )
     
     # 2. Assign "Operational Day" (Shift Day)
-    # RESTORED TO 5 HOURS: 8 hours was pushing 6am/7am starts to the previous day (Fixing A28, I28)
     df['WorkDate'] = df.apply(lambda r: (r['DateTime'] - timedelta(hours=5)).date(), axis=1)
     df['TimeOnly'] = df['DateTime'].dt.time
     df['CleanName'] = df['Name'].apply(clean_name)
@@ -61,6 +79,7 @@ def process_data(ts_file, att_file, start_date):
     
     output_data = []
     exception_logs = []
+    remark_logs = []  # NEW: For remarks sheet
 
     for cleaned_name, original_name in attendance_map.items():
         row_times = []
@@ -72,38 +91,34 @@ def process_data(ts_file, att_file, start_date):
             
             login_time = None
             logout_time = None
+            has_login = False
+            has_logout = False
             
             if not day_logs.empty:
-                # --- LOGIN LOGIC (Fixing M32) ---
-                # Strictly look for Start Work or Site In.
-                # If neither exists, force "NO LOGIN".
+                # --- LOGIN LOGIC ---
                 starts = day_logs[day_logs['Type'] == 'Start Work']
                 sites_in = day_logs[day_logs['Type'] == 'Site In']
                 
                 if not starts.empty:
-                    # Priority 1: Start Work
                     login_time = starts.sort_values('DateTime').iloc[0]['TimeOnly']
+                    has_login = True
                 elif not sites_in.empty:
-                    # Priority 2: Site In
                     login_time = sites_in.sort_values('DateTime').iloc[0]['TimeOnly']
+                    has_login = True
                 else:
-                    # No valid login event found
                     login_time = "NO LOGIN"
 
-                # --- LOGOUT LOGIC (Fixing H40, N32) ---
-                # Look for valid logout events (End Work OR Site Out).
-                # Combine them and take the ABSOLUTE LAST one by time.
+                # --- LOGOUT LOGIC ---
                 valid_logouts = day_logs[day_logs['Type'].isin(['End Work', 'Site Out'])]
                 
                 if not valid_logouts.empty:
-                    # Sort by time to find the actual last event
                     last_logout_event = valid_logouts.sort_values('DateTime').iloc[-1]
                     logout_time = last_logout_event['TimeOnly']
+                    has_logout = True
                 else:
                     logout_time = "NO LOGOUT"
 
                 # --- CLEANUP FOR EMPTY DAYS ---
-                # If a day has NO valid Login AND NO valid Logout, clear the cells completely
                 if login_time == "NO LOGIN" and logout_time == "NO LOGOUT":
                     login_time = None
                     logout_time = None
@@ -112,10 +127,20 @@ def process_data(ts_file, att_file, start_date):
                 if logout_time == "NO LOGOUT" and login_time is not None:
                     exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': login_time, 'Reason': 'Missing Logout'})
                 elif login_time == "NO LOGIN" and logout_time is not None:
-                     exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': logout_time, 'Reason': 'Logout without Login'})
-                elif login_time and logout_time:
-                    # Optional: Check for sequence issues if needed
-                    pass
+                    exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': logout_time, 'Reason': 'Logout without Login'})
+
+                # --- REMARK LOGGING (NEW) ---
+                # Check if any records for this day have remarks
+                day_remarks = day_logs[day_logs['Remark'].notna()]
+                for _, remark_row in day_remarks.iterrows():
+                    remark_logs.append({
+                        'Name': original_name,
+                        'Day': work_date.strftime('%d %b'),
+                        'Time': remark_row['TimeOnly'].strftime('%H:%M') if pd.notna(remark_row['TimeOnly']) else '',
+                        'Login': 'Yes' if has_login else 'No',
+                        'Logout': 'Yes' if has_logout else 'No',
+                        'Remark': remark_row['Remark']
+                    })
 
             # Handle explicit None for output
             row_times.extend([login_time if login_time else None, 
@@ -123,7 +148,7 @@ def process_data(ts_file, att_file, start_date):
                               
         output_data.append(row_times)
 
-    return pd.DataFrame(output_data), pd.DataFrame(exception_logs), date_range, raw_employee_list
+    return pd.DataFrame(output_data), pd.DataFrame(exception_logs), pd.DataFrame(remark_logs), date_range, raw_employee_list
 
 # --- UI DESIGN ---
 st.title("📊 Timesheet Audit Web Portal")
@@ -136,24 +161,37 @@ with col1:
 with col2:
     att_file = st.file_uploader("Upload Attendance_New.xlsx", type=['xlsx'])
 
-start_date_str = st.text_input("Enter Start Date (e.g., 23_Jan)", "")
+start_date_str = st.text_input("Enter Start Date (e.g., 23_Jan or 30_Jan)", "")
 
 if st.button("🚀 Generate Audit Report"):
     if ts_file and att_file and start_date_str:
         start_date = parse_date_manual(start_date_str)
         if start_date:
             with st.spinner('Processing...'):
-                df_out, df_ex, d_range, names = process_data(ts_file, att_file, start_date)
+                df_out, df_ex, df_remarks, d_range, names = process_data(ts_file, att_file, start_date)
                 
                 # Show Preview
-                st.success("Analysis Complete!")
-                st.subheader("Preview (Summary)")
-                st.dataframe(df_out)
+                st.success("✅ Analysis Complete!")
                 
-                # Prepare Excel
+                col_prev1, col_prev2, col_prev3 = st.columns(3)
+                with col_prev1:
+                    st.metric("Employees Processed", len(names))
+                with col_prev2:
+                    st.metric("Exceptions Found", len(df_ex))
+                with col_prev3:
+                    st.metric("Remarks Found", len(df_remarks))
+                
+                st.subheader("📋 Summary Preview")
+                st.dataframe(df_out.head(10))
+                
+                if len(df_remarks) > 0:
+                    st.subheader("💬 Remarks Preview")
+                    st.dataframe(df_remarks.head(10))
+                
+                # Prepare Excel with 3 sheets: Summary, Exceptions, Remarks
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    # Custom saving to match requested format
+                    # --- SUMMARY SHEET ---
                     wb = writer.book
                     ws = wb.create_sheet("Summary")
                     
@@ -162,6 +200,7 @@ if st.button("🚀 Generate Audit Report"):
                     center = openpyxl.styles.Alignment(horizontal='center')
                     red_text = openpyxl.styles.Font(color="FF0000", bold=True)
 
+                    # Headers
                     ws.cell(1, 1, "No").font = bold
                     ws.cell(1, 2, "Employee Name").font = bold
                     
@@ -173,6 +212,7 @@ if st.button("🚀 Generate Audit Report"):
                         ws.cell(2, col, "Login").font = bold
                         ws.cell(2, col+1, "Logout").font = bold
 
+                    # Data rows
                     for r_idx, (emp_name, row_vals) in enumerate(zip(names, df_out.itertuples(index=False)), start=3):
                         ws.cell(r_idx, 1, r_idx - 2)
                         ws.cell(r_idx, 2, emp_name)
@@ -187,8 +227,32 @@ if st.button("🚀 Generate Audit Report"):
                                 cell.value = val
                                 cell.number_format = 'HH:MM'
                     
-                    # Exceptions Sheet
+                    # --- EXCEPTIONS SHEET ---
                     df_ex.to_excel(writer, index=False, sheet_name="Exceptions")
+                    
+                    # --- REMARKS SHEET (NEW) ---
+                    if len(df_remarks) > 0:
+                        df_remarks.to_excel(writer, index=False, sheet_name="Remarks")
+                        
+                        # Format the Remarks sheet
+                        ws_remarks = wb["Remarks"]
+                        
+                        # Bold headers
+                        for cell in ws_remarks[1]:
+                            cell.font = bold
+                        
+                        # Auto-adjust column widths
+                        for column in ws_remarks.columns:
+                            max_length = 0
+                            column_letter = openpyxl.utils.get_column_letter(column[0].column)
+                            for cell in column:
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+                            adjusted_width = min(max_length + 2, 50)
+                            ws_remarks.column_dimensions[column_letter].width = adjusted_width
 
                 st.download_button(
                     label="📥 Download Audit Report",
@@ -196,7 +260,13 @@ if st.button("🚀 Generate Audit Report"):
                     file_name=f"Audit_Report_{start_date.strftime('%d_%b')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+                
+                st.success("✓ Report ready! The file includes Summary, Exceptions, and Remarks sheets.")
         else:
-            st.error("Invalid Date Format. Please use 'Day_Month' (e.g., 23_Jan)")
+            st.error("Invalid Date Format. Please use 'Day_Month' (e.g., 23_Jan or 30_Jan)")
     else:
-        st.warning("Please upload both files and enter a start date.")
+        st.warning("⚠️ Please upload both files and enter a start date.")
+
+# --- FOOTER ---
+st.markdown("---")
+st.markdown("**RDM Timesheet Auditor v2.0** | Enhanced with automatic time extraction and remarks tracking")
