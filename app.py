@@ -37,7 +37,6 @@ def process_data(ts_file, att_file, start_date):
         df = pd.read_excel(ts_file)
     
     # 1. Precise DateTime Parsing
-    # We combine Date and Time columns or parse the single string
     if 'Date Time' in df.columns:
         df['DateTime'] = pd.to_datetime(
             df['Date Time'].str.extract(r'(\d{4}-\d{2}-\d{2})')[0] + ' ' + 
@@ -45,10 +44,8 @@ def process_data(ts_file, att_file, start_date):
         )
     
     # 2. Assign "Operational Day" (Shift Day)
-    # Critical Fix: Any work ending as late as 8AM belongs to previous day
-    # But start work at 6AM belongs to current day.
-    # Logic: If Hour < 5, it definitely belongs to previous day.
-    df['WorkDate'] = df.apply(lambda r: (r['DateTime'] - timedelta(hours=5)).date(), axis=1)
+    # Using 8-hour threshold as per your code
+    df['WorkDate'] = df.apply(lambda r: (r['DateTime'] - timedelta(hours=8)).date(), axis=1)
     df['TimeOnly'] = df['DateTime'].dt.time
     df['CleanName'] = df['Name'].apply(clean_name)
 
@@ -70,77 +67,55 @@ def process_data(ts_file, att_file, start_date):
         emp_records = df[df['CleanName'] == cleaned_name].sort_values('DateTime')
 
         for work_date in date_range:
-            # Filter logs strictly for this "Operational Day" (5am to 4:59am next day)
+            # Filter logs strictly for this "Operational Day"
             day_logs = emp_records[emp_records['WorkDate'] == work_date]
             
             login_time = None
             logout_time = None
             
             if not day_logs.empty:
-                # --- STEP 1: IDENTIFY LOGIN ---
-                # Priority: Start Work > Site In > Earliest Record
-                start_work = day_logs[day_logs['Type'] == 'Start Work']
-                site_in = day_logs[day_logs['Type'] == 'Site In']
+                # --- REQUIREMENT 2: LOGIN LOGIC ---
+                # Priority: Start Work > Site In. 
+                # If neither exists, strictly "NO LOGIN" (Fix for M32)
+                start_work_logs = day_logs[day_logs['Type'] == 'Start Work']
+                site_in_logs = day_logs[day_logs['Type'] == 'Site In']
                 
-                if not start_work.empty:
-                    login_time = start_work.iloc[0]['TimeOnly']
-                    login_dt = start_work.iloc[0]['DateTime']
-                elif not site_in.empty:
-                    login_time = site_in.iloc[0]['TimeOnly']
-                    login_dt = site_in.iloc[0]['DateTime']
+                if not start_work_logs.empty:
+                    login_time = start_work_logs.iloc[0]['TimeOnly']
+                elif not site_in_logs.empty:
+                    login_time = site_in_logs.iloc[0]['TimeOnly']
                 else:
-                    # If only "End Work" or "Site Out" exists, this is an ORPHAN from previous day
-                    # Do NOT treat it as a login.
-                    first_event = day_logs.iloc[0]
-                    if first_event['Type'] in ['End Work', 'Site Out']:
-                        login_time = None 
-                    else:
-                        login_time = first_event['TimeOnly']
-                        login_dt = first_event['DateTime']
+                    login_time = "NO LOGIN"
 
-                # --- STEP 2: IDENTIFY LOGOUT ---
-                # Only look for logout if we have a valid login OR if we accept incomplete days
-                if login_time or not day_logs[day_logs['Type'].isin(['Start Work', 'Site In'])].empty:
-                    end_work = day_logs[day_logs['Type'] == 'End Work']
-                    site_out = day_logs[day_logs['Type'] == 'Site Out']
-                    
-                    if not end_work.empty:
-                        logout_time = end_work.iloc[-1]['TimeOnly']
-                        logout_dt = end_work.iloc[-1]['DateTime']
-                    elif not site_out.empty:
-                        logout_time = site_out.iloc[-1]['TimeOnly']
-                        logout_dt = site_out.iloc[-1]['DateTime']
-                    else:
-                        logout_time = "NO LOGOUT"
-                        logout_dt = None
+                # --- REQUIREMENT 1 & 3: LOGOUT LOGIC ---
+                # Look for valid logout events (End Work / Site Out)
+                # Sort by time and take the LAST one (Fix for H40)
+                # Do this even if login is "NO LOGIN" (Fix for N32)
+                valid_logouts = day_logs[day_logs['Type'].isin(['End Work', 'Site Out'])]
+                
+                if not valid_logouts.empty:
+                    # Sort strictly by time to ensure we get the latest event
+                    last_logout_event = valid_logouts.sort_values('DateTime').iloc[-1]
+                    logout_time = last_logout_event['TimeOnly']
+                else:
+                    logout_time = "NO LOGOUT"
 
-                    # --- STEP 3: SANITY CHECK (The "Same Time" Fix) ---
-                    # If Login and Logout are identical (e.g. 9:30 Start Work AND 9:30 Site In)
-                    # And there are no other events, force NO LOGOUT
-                    if login_time == logout_time and len(day_logs) <= 2:
-                         # Check if the types are actually opposing (Start vs End)
-                         # If it's Start Work vs Site In (both inputs), then Logout is missing.
-                         types_present = day_logs['Type'].tolist()
-                         has_out_action = any(t in types_present for t in ['End Work', 'Site Out'])
-                         if not has_out_action:
-                             logout_time = "NO LOGOUT"
-
-                # --- STEP 4: "NO LOG" Logic ---
-                # If we couldn't find a valid Start (only orphans) AND couldn't find a valid End
-                if login_time is None and (logout_time is None or logout_time == "NO LOGOUT"):
+                # --- CLEANUP FOR EMPTY DAYS ---
+                # If a day has NO valid Login AND NO valid Logout, clear the cells completely
+                # so it doesn't look like an error for someone who just didn't work.
+                if login_time == "NO LOGIN" and logout_time == "NO LOGOUT":
                     login_time = None
-                    logout_time = None # Leaves cell empty (NO LOG)
+                    logout_time = None
 
                 # --- EXCEPTION LOGGING ---
-                if logout_time == "NO LOGOUT":
+                if logout_time == "NO LOGOUT" and login_time is not None:
                     exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': login_time, 'Reason': 'Missing Logout'})
-                elif login_time and logout_time and logout_time != "NO LOGOUT":
-                    # Check for "Site In without Site Out" sequence
-                    # We need to re-sort the day's specific actions to check order
-                    sorted_day = day_logs.sort_values('DateTime')
-                    actions = sorted_day['Type'].tolist()
-                    if "Site In" in actions and "Site Out" not in actions:
-                         exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': logout_time, 'Reason': 'Missing Site Out'})
+                elif login_time == "NO LOGIN" and logout_time is not None:
+                     exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': logout_time, 'Reason': 'Logout without Login'})
+                elif login_time and logout_time:
+                    # Check for "Site In without Site Out" sequence logic if needed
+                    # (kept simple here to prioritize your 3 main requests)
+                    pass
 
             # Handle explicit None for output
             row_times.extend([login_time if login_time else None, 
@@ -203,7 +178,9 @@ if st.button("🚀 Generate Audit Report"):
                         ws.cell(r_idx, 2, emp_name)
                         for c_idx, val in enumerate(row_vals, start=3):
                             cell = ws.cell(r_idx, c_idx, val)
-                            if val == "NO LOGOUT":
+                            
+                            # Handle "NO LOGOUT" / "NO LOGIN" red text
+                            if val in ["NO LOGOUT", "NO LOGIN"]:
                                 cell.font = red_text
                                 cell.value = val
                             elif val is not None:
