@@ -78,13 +78,13 @@ def process_data(ts_file, att_file, start_date):
                 site_out_logs = day_logs[day_logs['Type'] == 'Site Out']
                 if not end_work_logs.empty: logout_time = end_work_logs.iloc[-1]['TimeOnly']
                 elif not site_out_logs.empty: logout_time = site_out_logs.iloc[-1]['TimeOnly']
-                else: logout_time = "NO LOGOUT"
+                else: logout_time = "NO LOG"
 
-                if len(day_logs) == 1 and logout_time != "NO LOGOUT":
+                if len(day_logs) == 1 and logout_time != "NO LOG":
                     if any(x in str(day_logs.iloc[0]['Type']) for x in ['Start Work', 'Site In']):
-                        logout_time = "NO LOGOUT"
+                        logout_time = "NO LOG"
 
-                if logout_time == "NO LOGOUT":
+                if logout_time == "NO LOG":
                     exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': login_time, 'Reason': 'Missing Logout'})
                 elif "Site In" in day_logs['Type'].values and "Site Out" not in day_logs['Type'].values:
                     exception_logs.append({'Name': original_name, 'Date': work_date, 'Time': logout_time, 'Reason': 'Missing Site Out'})
